@@ -99,16 +99,13 @@ pub struct Batch {
     labels: Option<Box<dyn BatchLabel>>,
 }
 
-pub struct Tokenizer {
-    loader: Box<dyn Node<Output = Text>>,
+pub struct Tokenizer<T: Node<Output = Text>> {
+    loader: T,
     tokenizer: tokenizer::Tokenizer,
 }
 
-impl Tokenizer {
-    fn new<S: AsRef<str>>(
-        loader: Box<dyn Node<Output = Text>>,
-        tokenizer: S,
-    ) -> Result<Tokenizer, tokenizer::Error> {
+impl<T: Node<Output = Text>> Tokenizer<T> {
+    fn new<S: AsRef<str>>(loader: T, tokenizer: S) -> Result<Tokenizer<T>, tokenizer::Error> {
         let tokenizer = tokenizer::Tokenizer::from_pretrained(tokenizer, None)?;
         Ok(Tokenizer { loader, tokenizer })
     }
@@ -128,7 +125,7 @@ impl Tokenizer {
     }
 }
 
-impl Node for Tokenizer {
+impl<T: Node<Output = Text>> Node for Tokenizer<T> {
     type Output = TokenizedText;
     fn get(&self, index: usize) -> Option<TokenizedText> {
         self.loader.get(index).map(|sample| self.tokenize(sample))
@@ -171,18 +168,18 @@ impl Node for TxtLoader {
     }
 }
 
-pub struct StaticBatcher {
-    tokenizer: Box<dyn Node<Output = TokenizedText>>,
+pub struct StaticBatcher<T: Node<Output = TokenizedText>> {
+    tokenizer: T,
     batch_size: usize,
     seq_length: usize,
 }
 
-impl StaticBatcher {
+impl<T: Node<Output = TokenizedText>> StaticBatcher<T> {
     pub fn new(
-        tokenizer: Box<dyn Node<Output = TokenizedText>>,
+        tokenizer: T,
         batch_size: usize,
         seq_length: usize,
-    ) -> Result<StaticBatcher, String> {
+    ) -> Result<StaticBatcher<T>, String> {
         Ok(StaticBatcher {
             tokenizer,
             batch_size,
@@ -237,7 +234,7 @@ impl StaticBatcher {
     }
 }
 
-impl Node for StaticBatcher {
+impl<T: Node<Output = TokenizedText>> Node for StaticBatcher<T> {
     type Output = Batch;
     fn next(&mut self) -> Option<Batch> {
         let mut samples: Vec<TokenizedText> = Vec::new();

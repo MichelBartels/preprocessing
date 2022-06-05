@@ -10,6 +10,19 @@ use crate::{
     TxtLoader,
 };
 
+impl<T: ToPyObjectConsume> Node for Box<dyn Node<Output = T>> {
+    type Output = T;
+    fn get(&self, index: usize) -> Option<Self::Output> {
+        self.get(index)
+    }
+    fn len(&self) -> Option<usize> {
+        self.len()
+    }
+    fn next(&mut self) -> Option<Self::Output> {
+        self.next()
+    }
+}
+
 pub trait ToPyObjectConsume {
     fn to_object_consume(self, py: Python<'_>) -> PyObject;
 }
@@ -149,8 +162,8 @@ add_py_node!(
 );
 
 add_node_constructor!(create_txt_loader: "TxtLoader" => (filename: String,) => TextNodePy: TxtLoader);
-add_node_constructor!(create_tokenizer: "Tokenizer" => (node: &mut TextNodePy, tokenizer: String,) => TokenizedTextNodePy: Tokenizer);
-add_node_constructor!(create_static_batcher: "StaticBatcher" => (node: &mut TokenizedTextNodePy, batch_size: usize, seq_length: usize,) => BatchNodePy: StaticBatcher);
+add_node_constructor!(create_tokenizer: "Tokenizer" => (node: &mut TextNodePy, tokenizer: String,) => TokenizedTextNodePy: Tokenizer<Box<dyn Node<Output = Text>>>);
+add_node_constructor!(create_static_batcher: "StaticBatcher" => (node: &mut TokenizedTextNodePy, batch_size: usize, seq_length: usize,) => BatchNodePy: StaticBatcher<Box<dyn Node<Output = TokenizedText>>>);
 
 #[pymodule]
 fn pyo3_test(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
