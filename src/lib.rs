@@ -1,4 +1,5 @@
 //use ndarray::prelude::*;
+#![feature(associated_type_bounds)]
 use numpy::ndarray::prelude::*;
 use std::usize;
 use tokenizers::tokenizer;
@@ -19,25 +20,21 @@ pub trait Node: Send {
     fn next(&mut self) -> Option<Self::Output>;
 }
 
+pub struct NoLabel();
 pub struct Span(Option<(usize, usize)>);
 
-pub trait Label: ToPyObjectConsume {
-    fn tokenize(
-        &self,
-        encoding: &tokenizer::Encoding,
-        starting_index: usize,
-    ) -> Option<Box<dyn TokenizedLabel>>;
+//pub trait Label: ToPyObjectConsume {
+pub trait Label {
+    type Tokenized: TokenizedLabel;
+    fn tokenize(self, encoding: &tokenizer::Encoding, starting_index: usize) -> Self::Tokenized;
 }
 
 impl Label for Span {
-    fn tokenize(
-        &self,
-        encoding: &tokenizer::Encoding,
-        starting_index: usize,
-    ) -> Option<Box<dyn TokenizedLabel>> {
+    type Tokenized = TokenizedSpan;
+    fn tokenize(self, encoding: &tokenizer::Encoding, starting_index: usize) -> TokenizedSpan {
         if let Some((mut start, mut end)) = self.0 {
             if start < starting_index {
-                return None;
+                return TokenizedSpan(None);
             }
             start -= starting_index;
             end -= starting_index;
@@ -45,21 +42,50 @@ impl Label for Span {
                 encoding.char_to_token(start, 1),
                 encoding.char_to_token(end, 1),
             ) {
-                return Some(Box::new(TokenizedSpan(Some((start, end)))));
+                return TokenizedSpan(Some((start, end)));
             }
         }
-        None
+        TokenizedSpan(None)
     }
 }
 
+impl Label for NoLabel {
+    type Tokenized = NoTokenizedLabel;
+    fn tokenize(self, encoding: &tokenizer::Encoding, starting_index: usize) -> NoTokenizedLabel {
+        NoTokenizedLabel
+    }
+}
+
+pub struct NoTokenizedLabel;
 pub struct TokenizedSpan(Option<(usize, usize)>);
 
-pub trait TokenizedLabel {}
-impl TokenizedLabel for TokenizedSpan {}
+pub trait TokenizedLabel: Sized {
+    type Batch: BatchLabel;
+    fn to_batch(selfs: Vec<Self>) -> Self::Batch;
+}
+impl TokenizedLabel for NoTokenizedLabel {
+    type Batch = NoBatchLabel;
+    fn to_batch(_selfs: Vec<Self>) -> NoBatchLabel {
+        NoBatchLabel
+    }
+}
 
-pub struct Text {
+impl TokenizedLabel for TokenizedSpan {
+    type Batch = BatchSpan;
+    fn to_batch(selfs: Vec<Self>) -> Self::Batch {
+        BatchSpan
+    }
+}
+
+pub struct NoBatchLabel;
+pub struct BatchSpan;
+
+impl BatchLabel for NoBatchLabel {}
+impl BatchLabel for BatchSpan {}
+
+pub struct Text<T: Label> {
     text: String,
-    label: Option<Box<dyn Label>>,
+    label: T,
 }
 
 #[derive(Debug)]
@@ -68,9 +94,9 @@ pub struct Encoding {
     pad_token: u32,
 }
 
-pub struct TokenizedText {
+pub struct TokenizedText<T: TokenizedLabel> {
     encoding: Encoding,
-    label: Option<Box<dyn TokenizedLabel>>,
+    label: T,
 }
 
 impl Encoding {
@@ -94,27 +120,27 @@ pub struct BatchEncoding {
     input_ids: Array2<u32>,
     pad_token: u32,
 }
-pub struct Batch {
+pub struct Batch<T: BatchLabel> {
     encoding: BatchEncoding,
-    labels: Option<Box<dyn BatchLabel>>,
+    labels: T,
 }
 
-pub struct Tokenizer<T: Node<Output = Text>> {
+pub struct Tokenizer<S: Label, T: Node<Output = Text<S>>> {
     loader: T,
     tokenizer: tokenizer::Tokenizer,
 }
 
-impl<T: Node<Output = Text>> Tokenizer<T> {
-    fn new<S: AsRef<str>>(loader: T, tokenizer: S) -> Result<Tokenizer<T>, tokenizer::Error> {
+impl<S: Label, T: Node<Output = Text<S>>> Tokenizer<S, T> {
+    fn new<R: AsRef<str>>(loader: T, tokenizer: R) -> Result<Tokenizer<S, T>, tokenizer::Error> {
         let tokenizer = tokenizer::Tokenizer::from_pretrained(tokenizer, None)?;
         Ok(Tokenizer { loader, tokenizer })
     }
-    fn tokenize(&self, input: Text) -> TokenizedText {
+    fn tokenize(&self, input: Text<S>) -> TokenizedText<S::Tokenized> {
         let tokens = self
             .tokenizer
             .encode(input.text, false)
             .expect("Failed to tokenize");
-        let label = input.label.and_then(|label| label.tokenize(&tokens, 0));
+        let label = input.label.tokenize(&tokens, 0);
         TokenizedText {
             encoding: Encoding::from_tokenizer_encoding(
                 tokens,
@@ -125,15 +151,15 @@ impl<T: Node<Output = Text>> Tokenizer<T> {
     }
 }
 
-impl<T: Node<Output = Text>> Node for Tokenizer<T> {
-    type Output = TokenizedText;
-    fn get(&self, index: usize) -> Option<TokenizedText> {
+impl<S: Label, T: Node<Output = Text<S>>> Node for Tokenizer<S, T> {
+    type Output = TokenizedText<S::Tokenized>;
+    fn get(&self, index: usize) -> Option<TokenizedText<S::Tokenized>> {
         self.loader.get(index).map(|sample| self.tokenize(sample))
     }
     fn len(&self) -> Option<usize> {
         self.loader.len()
     }
-    fn next(&mut self) -> Option<TokenizedText> {
+    fn next(&mut self) -> Option<TokenizedText<S::Tokenized>> {
         self.loader.next().map(|sample| self.tokenize(sample))
     }
 }
@@ -152,7 +178,7 @@ impl TxtLoader {
 }
 
 impl Node for TxtLoader {
-    type Output = Text;
+    type Output = Text<NoLabel>;
     // Not implemented for performance reasons
     fn get(&self, _index: usize) -> Option<Self::Output> {
         None
@@ -163,40 +189,43 @@ impl Node for TxtLoader {
     fn next(&mut self) -> Option<Self::Output> {
         self.lines.next().map(|line| Text {
             text: line.expect("Failed to read line"),
-            label: None,
+            label: NoLabel(),
         })
     }
 }
 
-pub struct StaticBatcher<T: Node<Output = TokenizedText>> {
+pub struct StaticBatcher<S: TokenizedLabel, T: Node<Output = TokenizedText<S>>> {
     tokenizer: T,
     batch_size: usize,
     seq_length: usize,
 }
 
-impl<T: Node<Output = TokenizedText>> StaticBatcher<T> {
+impl<S: TokenizedLabel, T: Node<Output = TokenizedText<S>>> StaticBatcher<S, T> {
     pub fn new(
         tokenizer: T,
         batch_size: usize,
         seq_length: usize,
-    ) -> Result<StaticBatcher<T>, String> {
+    ) -> Result<StaticBatcher<S, T>, String> {
         Ok(StaticBatcher {
             tokenizer,
             batch_size,
             seq_length,
         })
     }
-    pub fn create_batch(&self, samples: Vec<TokenizedText>) -> Batch {
+    pub fn create_batch(&self, samples: Vec<TokenizedText<S>>) -> Batch<S::Batch> {
         let mut inputs: Vec<Array2<u32>> = Vec::new();
+        let mut labels: Vec<S> = Vec::new();
         let mut pad_token = 0;
-        for (i, sample) in samples.iter().enumerate() {
+        let len = samples.len();
+        for (i, sample) in samples.into_iter().enumerate() {
             let TokenizedText { encoding, label } = sample;
+            labels.push(label);
             let Encoding {
                 input_ids,
                 pad_token: current_pad_token,
             } = encoding;
             let arrays = vec![input_ids];
-            pad_token = *current_pad_token;
+            pad_token = current_pad_token;
             for (j, array) in arrays.iter().enumerate() {
                 match inputs.get_mut(j) {
                     Some(matrix) => {
@@ -209,7 +238,7 @@ impl<T: Node<Output = TokenizedText>> StaticBatcher<T> {
                             .assign(&array.slice(s![..len]));
                     }
                     None => {
-                        let mut matrix = Array2::zeros((samples.len(), self.seq_length));
+                        let mut matrix = Array2::zeros((len, self.seq_length));
                         matrix.fill(pad_token);
                         let mut len = array.len();
                         if len > self.seq_length {
@@ -229,15 +258,15 @@ impl<T: Node<Output = TokenizedText>> StaticBatcher<T> {
                 input_ids,
                 pad_token,
             },
-            labels: None,
+            labels: S::to_batch(labels),
         }
     }
 }
 
-impl<T: Node<Output = TokenizedText>> Node for StaticBatcher<T> {
-    type Output = Batch;
-    fn next(&mut self) -> Option<Batch> {
-        let mut samples: Vec<TokenizedText> = Vec::new();
+impl<S: TokenizedLabel, T: Node<Output = TokenizedText<S>>> Node for StaticBatcher<S, T> {
+    type Output = Batch<S::Batch>;
+    fn next(&mut self) -> Option<Batch<S::Batch>> {
+        let mut samples: Vec<TokenizedText<S>> = Vec::new();
         for _ in 0..self.batch_size {
             match self.tokenizer.next() {
                 Some(sample) => samples.push(sample),
@@ -250,9 +279,9 @@ impl<T: Node<Output = TokenizedText>> Node for StaticBatcher<T> {
             Some(self.create_batch(samples))
         }
     }
-    fn get(&self, index: usize) -> Option<Batch> {
+    fn get(&self, index: usize) -> Option<Batch<S::Batch>> {
         let index = index * self.batch_size;
-        let mut samples: Vec<TokenizedText> = Vec::new();
+        let mut samples: Vec<TokenizedText<S>> = Vec::new();
         for i in index..index + self.batch_size {
             match self.tokenizer.get(i) {
                 Some(sample) => samples.push(sample),
