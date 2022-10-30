@@ -4,10 +4,7 @@ use numpy::ndarray::prelude::*;
 use std::usize;
 use tokenizers::tokenizer;
 
-use std::fs::File;
-use std::io::{self, BufRead};
-use std::path::Path;
-
+mod datasets;
 mod python;
 mod test;
 
@@ -20,11 +17,13 @@ pub trait Node: Send {
     fn next(&mut self) -> Option<Self::Output>;
 }
 
+#[derive(Clone)]
 pub struct NoLabel();
+#[derive(Clone)]
 pub struct Span(Option<(usize, usize)>);
 
 //pub trait Label: ToPyObjectConsume {
-pub trait Label {
+pub trait Label: Clone + ToPyObjectConsume {
     type Tokenized: TokenizedLabel;
     fn tokenize(self, encoding: &tokenizer::Encoding, starting_index: usize) -> Self::Tokenized;
 }
@@ -38,9 +37,10 @@ impl Label for Span {
             }
             start -= starting_index;
             end -= starting_index;
+            let sequence_index = encoding.n_sequences() - 1;
             if let (Some(start), Some(end)) = (
-                encoding.char_to_token(start, 1),
-                encoding.char_to_token(end, 1),
+                encoding.char_to_token(start, sequence_index),
+                encoding.char_to_token(end, sequence_index),
             ) {
                 return TokenizedSpan(Some((start, end)));
             }
@@ -59,7 +59,7 @@ impl Label for NoLabel {
 pub struct NoTokenizedLabel;
 pub struct TokenizedSpan(Option<(usize, usize)>);
 
-pub trait TokenizedLabel: Sized {
+pub trait TokenizedLabel: Sized + ToPyObjectConsume {
     type Batch: BatchLabel;
     fn to_batch(selfs: Vec<Self>) -> Self::Batch;
 }
@@ -73,19 +73,87 @@ impl TokenizedLabel for NoTokenizedLabel {
 impl TokenizedLabel for TokenizedSpan {
     type Batch = BatchSpan;
     fn to_batch(selfs: Vec<Self>) -> Self::Batch {
-        BatchSpan
+        let mut start = Vec::new();
+        let mut end = Vec::new();
+        for span in selfs.into_iter() {
+            match span.0 {
+                Some((start_index, end_index)) => {
+                    start.push(start_index);
+                    end.push(end_index);
+                }
+                None => {
+                    start.push(0);
+                    end.push(0);
+                }
+            };
+        }
+        let start = Array1::from_vec(start);
+        let end = Array1::from_vec(end);
+        BatchSpan { start, end }
     }
 }
 
 pub struct NoBatchLabel;
-pub struct BatchSpan;
+pub struct BatchSpan {
+    start: Array1<usize>,
+    end: Array1<usize>,
+}
 
 impl BatchLabel for NoBatchLabel {}
 impl BatchLabel for BatchSpan {}
 
+#[derive(Clone)]
 pub struct Text<T: Label> {
     text: String,
     label: T,
+}
+
+#[derive(Clone)]
+pub struct TextPair<T: Label> {
+    text: (String, String),
+    label: T,
+}
+
+pub trait Sample {
+    type Label: Label;
+    fn tokenize(
+        self,
+        tokenizer: &tokenizer::Tokenizer,
+    ) -> TokenizedText<<<Self as Sample>::Label as Label>::Tokenized>;
+}
+
+impl<T: Label> Sample for Text<T> {
+    type Label = T;
+    fn tokenize(self, tokenizer: &tokenizer::Tokenizer) -> TokenizedText<T::Tokenized> {
+        let tokens = tokenizer
+            .encode(self.text, false)
+            .expect("Failed to tokenize");
+        let label = self.label.tokenize(&tokens, 0);
+        TokenizedText {
+            encoding: Encoding::from_tokenizer_encoding(
+                tokens,
+                tokenizer.get_padding().map_or(0, |pad| pad.pad_id),
+            ),
+            label: label,
+        }
+    }
+}
+
+impl<T: Label> Sample for TextPair<T> {
+    type Label = T;
+    fn tokenize(self, tokenizer: &tokenizer::Tokenizer) -> TokenizedText<T::Tokenized> {
+        let tokens = tokenizer
+            .encode(self.text, false)
+            .expect("Failed to tokenize");
+        let label = self.label.tokenize(&tokens, 0);
+        TokenizedText {
+            encoding: Encoding::from_tokenizer_encoding(
+                tokens,
+                tokenizer.get_padding().map_or(0, |pad| pad.pad_id),
+            ),
+            label: label,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -114,7 +182,7 @@ impl Encoding {
 
 pub struct BatchAnswer {}
 
-pub trait BatchLabel {}
+pub trait BatchLabel: ToPyObjectConsume {}
 
 pub struct BatchEncoding {
     input_ids: Array2<u32>,
@@ -125,72 +193,32 @@ pub struct Batch<T: BatchLabel> {
     labels: T,
 }
 
-pub struct Tokenizer<S: Label, T: Node<Output = Text<S>>> {
+pub struct Tokenizer<T: Node<Output: Sample>> {
     loader: T,
     tokenizer: tokenizer::Tokenizer,
 }
 
-impl<S: Label, T: Node<Output = Text<S>>> Tokenizer<S, T> {
-    fn new<R: AsRef<str>>(loader: T, tokenizer: R) -> Result<Tokenizer<S, T>, tokenizer::Error> {
+impl<T: Node<Output: Sample>> Tokenizer<T> {
+    fn new<S: AsRef<str>>(loader: T, tokenizer: S) -> Result<Tokenizer<T>, tokenizer::Error> {
         let tokenizer = tokenizer::Tokenizer::from_pretrained(tokenizer, None)?;
         Ok(Tokenizer { loader, tokenizer })
     }
-    fn tokenize(&self, input: Text<S>) -> TokenizedText<S::Tokenized> {
-        let tokens = self
-            .tokenizer
-            .encode(input.text, false)
-            .expect("Failed to tokenize");
-        let label = input.label.tokenize(&tokens, 0);
-        TokenizedText {
-            encoding: Encoding::from_tokenizer_encoding(
-                tokens,
-                self.tokenizer.get_padding().map_or(0, |pad| pad.pad_id),
-            ),
-            label: label,
-        }
-    }
 }
 
-impl<S: Label, T: Node<Output = Text<S>>> Node for Tokenizer<S, T> {
-    type Output = TokenizedText<S::Tokenized>;
-    fn get(&self, index: usize) -> Option<TokenizedText<S::Tokenized>> {
-        self.loader.get(index).map(|sample| self.tokenize(sample))
+impl<T: Node<Output: Sample>> Node for Tokenizer<T> {
+    type Output = TokenizedText<<<<T as Node>::Output as Sample>::Label as Label>::Tokenized>;
+    fn get(&self, index: usize) -> Option<Self::Output> {
+        self.loader
+            .get(index)
+            .map(|sample| sample.tokenize(&self.tokenizer))
     }
     fn len(&self) -> Option<usize> {
         self.loader.len()
     }
-    fn next(&mut self) -> Option<TokenizedText<S::Tokenized>> {
-        self.loader.next().map(|sample| self.tokenize(sample))
-    }
-}
-
-pub struct TxtLoader {
-    lines: io::Lines<io::BufReader<File>>,
-}
-
-impl TxtLoader {
-    fn new<P: AsRef<Path>>(file: P) -> io::Result<TxtLoader> {
-        let file = File::open(file)?;
-        Ok(TxtLoader {
-            lines: io::BufReader::new(file).lines(),
-        })
-    }
-}
-
-impl Node for TxtLoader {
-    type Output = Text<NoLabel>;
-    // Not implemented for performance reasons
-    fn get(&self, _index: usize) -> Option<Self::Output> {
-        None
-    }
-    fn len(&self) -> Option<usize> {
-        None
-    }
     fn next(&mut self) -> Option<Self::Output> {
-        self.lines.next().map(|line| Text {
-            text: line.expect("Failed to read line"),
-            label: NoLabel(),
-        })
+        self.loader
+            .next()
+            .map(|sample| sample.tokenize(&self.tokenizer))
     }
 }
 
